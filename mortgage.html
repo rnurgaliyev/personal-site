@@ -31,6 +31,13 @@
   <label><span>Tilgung rate %</span><input type="text" id="tilgung" placeholder="e.g. 2"></label>
   <label><span>Sondertilgung / year</span><input type="text" id="sonder" placeholder='EUR amount or "max"' value="0"></label>
   <label><span>Sondertilgung % (for "max")</span><input type="text" id="sonderPct" placeholder="% of original loan"></label>
+  <label><span>Sondertilgung timing</span><select id="sonderTiming">
+    <option value="end" selected>End of year</option>
+    <option value="start">Beginning of year</option>
+    <option value="quarterly">Spread across quarters</option>
+  </select></label>
+  <label><span>Sondertilgung per year</span><input type="text" id="sonderYear" placeholder="e.g. 1:20000,3-4:10000"></label>
+  <div class="hint">Optional per-year override of the yearly Sondertilgung. Years not listed use the value above.</div>
   <label><span>Show table</span><input type="checkbox" id="showTable" checked></label>
   <button id="calc">Calculate</button>
 </fieldset>
@@ -46,6 +53,12 @@
 const LAND_TAX_PCT = 6.0;
 const NOTARY_PCT = 1.8;
 
+const SONDER_TIMING_LABELS = {
+  end: "end of year",
+  start: "beginning of year",
+  quarterly: "spread across quarters",
+};
+
 function money(x) {
   return Math.round((x + 1e-9) * 100) / 100;
 }
@@ -59,6 +72,40 @@ function parseNum(raw, name) {
   const v = Number(raw.trim());
   if (!Number.isFinite(v)) throw new Error(name + " must be a valid number");
   return v;
+}
+
+function parseSonderYear(raw) {
+  // Parse "1:20000,3-4:10000" into a { year: amount } map. Returns null if empty.
+  if (raw == null || raw.trim() === "") return null;
+  const result = {};
+  for (const token of raw.split(",")) {
+    const entry = token.trim();
+    if (entry === "") continue;
+    const idx = entry.indexOf(":");
+    if (idx < 0) throw new Error('sonder-year entry must be "year:amount" (e.g. 1:20000 or 3-4:10000)');
+    const spec = entry.slice(0, idx).trim();
+    const amountRaw = entry.slice(idx + 1).trim();
+    if (amountRaw === "") throw new Error("sonder-year amount must be a number >= 0");
+    const amount = Number(amountRaw);
+    if (!Number.isFinite(amount) || amount < 0) throw new Error("sonder-year amount must be a number >= 0");
+    let years;
+    if (spec.includes("-")) {
+      const dash = spec.indexOf("-");
+      const lo = Number(spec.slice(0, dash).trim());
+      const hi = Number(spec.slice(dash + 1).trim());
+      if (!Number.isInteger(lo) || !Number.isInteger(hi) || lo < 1 || hi < lo) {
+        throw new Error("invalid sonder-year range: " + spec);
+      }
+      years = [];
+      for (let y = lo; y <= hi; y++) years.push(y);
+    } else {
+      const y = Number(spec);
+      if (!Number.isInteger(y) || y < 1) throw new Error("invalid sonder-year: " + spec);
+      years = [y];
+    }
+    for (const y of years) result[y] = money(amount);
+  }
+  return Object.keys(result).length ? result : null;
 }
 
 function calculatePurchaseCosts(price, capital) {
@@ -91,12 +138,15 @@ function resolveLoanAmount(loan, price, capital) {
   return { loan: costs.loan, costs };
 }
 
-function buildSchedule(loan, ratePct, years, tilgungPct, sonder, sonderPct) {
+function buildSchedule(loan, ratePct, years, tilgungPct, sonder, sonderPct, sonderTiming, sonderByYear) {
   loan = money(loan);
   if (loan <= 0) throw new Error("loan must be greater than 0");
   if (ratePct < 0) throw new Error("rate must be at least 0");
   if (tilgungPct <= 0) throw new Error("tilgung must be greater than 0");
   if (!Number.isInteger(years) || years <= 0) throw new Error("years must be a positive integer");
+  if (!(sonderTiming in SONDER_TIMING_LABELS)) {
+    throw new Error("sonder-timing must be one of: end, start, quarterly");
+  }
 
   // Banks compute monthly interest as Sollzins / 12 on the outstanding balance.
   const monthlyRate = ratePct / 100 / 12;
@@ -137,10 +187,27 @@ function buildSchedule(loan, ratePct, years, tilgungPct, sonder, sonderPct) {
     const payment = money(interest + principal);
     balance = money(startBalance - principal);
 
+    // A per-year override takes precedence over the global yearly amount.
+    const year = Math.floor((m - 1) / 12) + 1;
+    const yearSonder = (sonderByYear && year in sonderByYear) ? sonderByYear[year] : yearlySonder;
     let sonderApplied = 0;
-    if (yearlySonder > 0 && m % 12 === 0 && balance > 0) {
-      sonderApplied = Math.min(yearlySonder, balance);
-      balance = money(balance - sonderApplied);
+    if (yearSonder > 0 && balance > 0) {
+      let due = 0;
+      if (sonderTiming === "end" && m % 12 === 0) {
+        due = yearSonder;
+      } else if (sonderTiming === "start" && m % 12 === 1) {
+        due = yearSonder;
+      } else if (sonderTiming === "quarterly" && m % 3 === 0) {
+        const quarterlySonder = money(yearSonder / 4);
+        const quarterInYear = Math.floor(((m - 1) % 12) / 3) + 1;
+        due = quarterInYear === 4
+          ? money(yearSonder - quarterlySonder * 3)
+          : quarterlySonder;
+      }
+      if (due > 0) {
+        sonderApplied = Math.min(due, balance);
+        balance = money(balance - sonderApplied);
+      }
     }
 
     cumInterest = money(cumInterest + interest);
@@ -148,7 +215,7 @@ function buildSchedule(loan, ratePct, years, tilgungPct, sonder, sonderPct) {
 
     rows.push({
       month: m,
-      year: Math.floor((m - 1) / 12) + 1,
+      year,
       startBalance, payment, interest, principal,
       sonder: sonderApplied, endBalance: balance,
       cumInterest, cumPrincipal,
@@ -161,7 +228,7 @@ function pad(label) {
   return (label + " ".repeat(20)).slice(0, 20);
 }
 
-function buildSummary(costs, loan, rate, tilgung, years, monthlyAnnuity, sonder, sonderPct) {
+function buildSummary(costs, loan, rate, tilgung, years, monthlyAnnuity, sonder, sonderPct, sonderTiming, sonderByYear) {
   const lines = [];
   lines.push("German Mortgage — Annuitätendarlehen");
   lines.push("=".repeat(40));
@@ -177,10 +244,19 @@ function buildSummary(costs, loan, rate, tilgung, years, monthlyAnnuity, sonder,
   lines.push(pad("Initial tilgung rate") + ": " + tilgung.toFixed(3) + " %");
   lines.push(pad("Term") + ": " + years + " years");
   lines.push(pad("Monthly payment") + ": " + fmt(monthlyAnnuity) + " EUR");
+  const timingLabel = SONDER_TIMING_LABELS[sonderTiming];
   if (typeof sonder === "string") {
-    lines.push(pad("Sondertilgung") + ": max (" + sonderPct.toFixed(2) + " % of loan / year)");
+    lines.push(pad("Sondertilgung") + ": max (" + sonderPct.toFixed(2) + " % of loan / year, " + timingLabel + ")");
   } else if (sonder) {
-    lines.push(pad("Sondertilgung") + ": " + fmt(sonder) + " EUR / year");
+    lines.push(pad("Sondertilgung") + ": " + fmt(sonder) + " EUR / year (" + timingLabel + ")");
+  }
+  if (sonderByYear) {
+    const perYear = Object.keys(sonderByYear)
+      .map(Number)
+      .sort((a, b) => a - b)
+      .map(y => "year " + y + ": " + fmt(sonderByYear[y]) + " EUR")
+      .join("; ");
+    lines.push(pad("Per-year Sondertilg.") + ": " + perYear + " (" + timingLabel + ")");
   }
   return lines.join("\n");
 }
@@ -239,6 +315,8 @@ function calculate() {
     const yearsNum = parseNum(document.getElementById("years").value, "years");
     const tilgung = parseNum(document.getElementById("tilgung").value, "tilgung");
     const sonderPct = parseNum(document.getElementById("sonderPct").value, "sonder-pct");
+    const sonderTiming = document.getElementById("sonderTiming").value;
+    const sonderByYear = parseSonderYear(document.getElementById("sonderYear").value);
 
     let sonderRaw = document.getElementById("sonder").value.trim();
     let sonder;
@@ -257,9 +335,9 @@ function calculate() {
     if (tilgung == null) throw new Error("tilgung is required");
 
     const resolved = resolveLoanAmount(loan, price, capital);
-    const result = buildSchedule(resolved.loan, rate, yearsNum, tilgung, sonder, sonderPct);
+    const result = buildSchedule(resolved.loan, rate, yearsNum, tilgung, sonder, sonderPct, sonderTiming, sonderByYear);
 
-    sumEl.textContent = buildSummary(resolved.costs, resolved.loan, rate, tilgung, yearsNum, result.monthlyAnnuity, sonder, sonderPct);
+    sumEl.textContent = buildSummary(resolved.costs, resolved.loan, rate, tilgung, yearsNum, result.monthlyAnnuity, sonder, sonderPct, sonderTiming, sonderByYear);
 
     if (document.getElementById("showTable").checked) {
       tblEl.innerHTML = buildTable(result.rows);
@@ -272,6 +350,7 @@ function calculate() {
 
 document.getElementById("calc").addEventListener("click", calculate);
 document.getElementById("showTable").addEventListener("change", calculate);
+document.getElementById("sonderTiming").addEventListener("change", calculate);
 </script>
 </body>
 </html>
