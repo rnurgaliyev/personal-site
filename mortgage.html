@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>German Mortgage Calculator (Annuitätendarlehen)</title>
+<style>
+  body { font-family: monospace; margin: 1rem; }
+  fieldset { margin-bottom: 1rem; max-width: 640px; }
+  label { display: block; margin: 4px 0; }
+  label span { display: inline-block; width: 220px; }
+  input[type="text"] { width: 160px; }
+  pre { white-space: pre-wrap; }
+  table { border-collapse: collapse; margin-top: 1rem; }
+  th, td { border: 1px solid #999; padding: 2px 8px; text-align: right; }
+  .error { color: #b00; font-weight: bold; }
+  .hint { color: #666; }
+</style>
+</head>
+<body>
+<h2>German Mortgage — Annuitätendarlehen</h2>
+
+<fieldset>
+  <legend>Inputs</legend>
+  <label><span>Initial loan size (EUR)</span><input type="text" id="loan" placeholder="e.g. 300000"></label>
+  <label><span>Property price (EUR)</span><input type="text" id="price" placeholder="e.g. 665000"></label>
+  <label><span>Available capital (EUR)</span><input type="text" id="capital" placeholder="default 0"></label>
+  <div class="hint">Use <b>loan</b> directly, OR <b>price</b> (+ optional capital). Fees added: 6.0% land tax, 1.8% notary.</div>
+  <label><span>Interest rate % (Sollzins)</span><input type="text" id="rate" placeholder="e.g. 3.85"></label>
+  <label><span>Term (years)</span><input type="text" id="years" placeholder="e.g. 10"></label>
+  <label><span>Tilgung rate %</span><input type="text" id="tilgung" placeholder="e.g. 2"></label>
+  <label><span>Sondertilgung / year</span><input type="text" id="sonder" placeholder='EUR amount or "max"' value="0"></label>
+  <label><span>Sondertilgung % (for "max")</span><input type="text" id="sonderPct" placeholder="% of original loan"></label>
+  <label><span>Show table</span><input type="checkbox" id="showTable" checked></label>
+  <button id="calc">Calculate</button>
+</fieldset>
+
+<div id="error" class="error"></div>
+<pre id="summary"></pre>
+<div id="tableWrap"></div>
+<pre id="footer"></pre>
+
+<script>
+"use strict";
+
+const LAND_TAX_PCT = 6.0;
+const NOTARY_PCT = 1.8;
+
+function money(x) {
+  return Math.round((x + 1e-9) * 100) / 100;
+}
+
+function fmt(x) {
+  return x.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function parseNum(raw, name) {
+  if (raw === null || raw.trim() === "") return null;
+  const v = Number(raw.trim());
+  if (!Number.isFinite(v)) throw new Error(name + " must be a valid number");
+  return v;
+}
+
+function calculatePurchaseCosts(price, capital) {
+  price = money(price);
+  capital = money(capital == null ? 0 : capital);
+  if (price <= 0) throw new Error("price must be greater than 0");
+  if (capital < 0) throw new Error("capital must be at least 0");
+  const landTax = money(price * LAND_TAX_PCT / 100);
+  const notary = money(price * NOTARY_PCT / 100);
+  const totalCost = money(price + landTax + notary);
+  const loan = money(totalCost - capital);
+  if (loan <= 0) throw new Error("total cost minus capital must be greater than 0");
+  return { price, capital, landTaxPct: LAND_TAX_PCT, landTax, notaryPct: NOTARY_PCT, notary, totalCost, loan };
+}
+
+function resolveLoanAmount(loan, price, capital) {
+  if (loan != null && (price != null || capital != null)) {
+    throw new Error("provide either loan, or price/capital — not both");
+  }
+  if (loan != null) {
+    const result = money(loan);
+    if (result <= 0) throw new Error("loan must be greater than 0");
+    return { loan: result, costs: null };
+  }
+  if (price == null) {
+    if (capital != null) throw new Error("capital requires price (or use loan on its own)");
+    throw new Error("provide either loan, or price (with optional capital)");
+  }
+  const costs = calculatePurchaseCosts(price, capital);
+  return { loan: costs.loan, costs };
+}
+
+function buildSchedule(loan, ratePct, years, tilgungPct, sonder, sonderPct) {
+  loan = money(loan);
+  if (loan <= 0) throw new Error("loan must be greater than 0");
+  if (ratePct < 0) throw new Error("rate must be at least 0");
+  if (tilgungPct <= 0) throw new Error("tilgung must be greater than 0");
+  if (!Number.isInteger(years) || years <= 0) throw new Error("years must be a positive integer");
+
+  // Banks compute monthly interest as Sollzins / 12 on the outstanding balance.
+  const monthlyRate = ratePct / 100 / 12;
+  const annualAnnuity = loan * (ratePct + tilgungPct) / 100;
+  const monthlyAnnuity = money(annualAnnuity / 12);
+
+  let yearlySonder;
+  const isMax = typeof sonder === "string" && sonder.toLowerCase() === "max";
+  if (isMax) {
+    if (sonderPct == null) throw new Error('sondertilgung "max" requires a sondertilgung %');
+    if (sonderPct < 0) throw new Error("sonder-pct must be at least 0");
+    if (sonderPct > 100) throw new Error("sonder-pct must not exceed 100");
+    yearlySonder = money(loan * sonderPct / 100);
+  } else {
+    if (sonderPct != null) throw new Error("sondertilgung % is only valid with sonder = max");
+    yearlySonder = money(sonder);
+    if (yearlySonder < 0) throw new Error("sonder must be at least 0");
+  }
+
+  const firstMonthInterest = money(loan * monthlyRate);
+  if (monthlyAnnuity <= firstMonthInterest) {
+    throw new Error("monthly payment is not high enough to reduce principal");
+  }
+
+  const rows = [];
+  let balance = loan;
+  const totalMonths = years * 12;
+  let cumInterest = 0;
+  let cumPrincipal = 0;
+
+  for (let m = 1; m <= totalMonths; m++) {
+    if (balance <= 0) break;
+    const startBalance = balance;
+    const interest = money(startBalance * monthlyRate);
+    let principal = money(monthlyAnnuity - interest);
+    if (principal <= 0) throw new Error("monthly payment is not high enough to reduce principal");
+    if (principal > startBalance) principal = startBalance;
+    const payment = money(interest + principal);
+    balance = money(startBalance - principal);
+
+    let sonderApplied = 0;
+    if (yearlySonder > 0 && m % 12 === 0 && balance > 0) {
+      sonderApplied = Math.min(yearlySonder, balance);
+      balance = money(balance - sonderApplied);
+    }
+
+    cumInterest = money(cumInterest + interest);
+    cumPrincipal = money(cumPrincipal + principal + sonderApplied);
+
+    rows.push({
+      month: m,
+      year: Math.floor((m - 1) / 12) + 1,
+      startBalance, payment, interest, principal,
+      sonder: sonderApplied, endBalance: balance,
+      cumInterest, cumPrincipal,
+    });
+  }
+  return { rows, monthlyAnnuity, totalInterest: cumInterest };
+}
+
+function pad(label) {
+  return (label + " ".repeat(20)).slice(0, 20);
+}
+
+function buildSummary(costs, loan, rate, tilgung, years, monthlyAnnuity, sonder, sonderPct) {
+  const lines = [];
+  lines.push("German Mortgage — Annuitätendarlehen");
+  lines.push("=".repeat(40));
+  if (costs) {
+    lines.push(pad("Property price") + ": " + fmt(costs.price) + " EUR");
+    lines.push(pad("Land transfer tax") + ": " + fmt(costs.landTax) + " EUR (" + costs.landTaxPct.toFixed(1) + " %)");
+    lines.push(pad("Notary/register") + ": " + fmt(costs.notary) + " EUR (" + costs.notaryPct.toFixed(1) + " %)");
+    lines.push(pad("Total purchase cost") + ": " + fmt(costs.totalCost) + " EUR");
+    lines.push(pad("Available capital") + ": " + fmt(costs.capital) + " EUR");
+  }
+  lines.push(pad("Loan amount") + ": " + fmt(loan) + " EUR");
+  lines.push(pad("Annual interest rate") + ": " + rate.toFixed(3) + " %");
+  lines.push(pad("Initial tilgung rate") + ": " + tilgung.toFixed(3) + " %");
+  lines.push(pad("Term") + ": " + years + " years");
+  lines.push(pad("Monthly payment") + ": " + fmt(monthlyAnnuity) + " EUR");
+  if (typeof sonder === "string") {
+    lines.push(pad("Sondertilgung") + ": max (" + sonderPct.toFixed(2) + " % of loan / year)");
+  } else if (sonder) {
+    lines.push(pad("Sondertilgung") + ": " + fmt(sonder) + " EUR / year");
+  }
+  return lines.join("\n");
+}
+
+function buildTable(rows) {
+  const headers = ["Mon", "Yr", "Start Balance", "Payment", "Interest",
+    "Tilgung", "Sonder", "End Balance", "Cumulative Interest", "Cumulative Principal"];
+  let html = "<table><thead><tr>";
+  for (const h of headers) html += "<th>" + h + "</th>";
+  html += "</tr></thead><tbody>";
+  for (const r of rows) {
+    html += "<tr>"
+      + "<td>" + r.month + "</td>"
+      + "<td>" + r.year + "</td>"
+      + "<td>" + fmt(r.startBalance) + "</td>"
+      + "<td>" + fmt(r.payment) + "</td>"
+      + "<td>" + fmt(r.interest) + "</td>"
+      + "<td>" + fmt(r.principal) + "</td>"
+      + "<td>" + fmt(r.sonder) + "</td>"
+      + "<td>" + fmt(r.endBalance) + "</td>"
+      + "<td>" + fmt(r.cumInterest) + "</td>"
+      + "<td>" + fmt(r.cumPrincipal) + "</td>"
+      + "</tr>";
+  }
+  html += "</tbody></table>";
+  return html;
+}
+
+function buildFooter(rows, totalInterest) {
+  const last = rows[rows.length - 1];
+  const lines = [];
+  lines.push("Remaining debt (Restschuld) after " + rows.length + " months: " + fmt(last.endBalance) + " EUR");
+  lines.push("Total interest paid: " + fmt(totalInterest) + " EUR");
+  lines.push("Total principal repaid: " + fmt(last.cumPrincipal) + " EUR");
+  if (last.endBalance <= 0.005) {
+    lines.push("Loan fully repaid in month " + last.month + " (year " + last.year + ").");
+  }
+  return lines.join("\n");
+}
+
+function calculate() {
+  const errEl = document.getElementById("error");
+  const sumEl = document.getElementById("summary");
+  const tblEl = document.getElementById("tableWrap");
+  const footEl = document.getElementById("footer");
+  errEl.textContent = "";
+  sumEl.textContent = "";
+  tblEl.innerHTML = "";
+  footEl.textContent = "";
+
+  try {
+    const loan = parseNum(document.getElementById("loan").value, "loan");
+    const price = parseNum(document.getElementById("price").value, "price");
+    const capital = parseNum(document.getElementById("capital").value, "capital");
+    const rate = parseNum(document.getElementById("rate").value, "rate");
+    const yearsNum = parseNum(document.getElementById("years").value, "years");
+    const tilgung = parseNum(document.getElementById("tilgung").value, "tilgung");
+    const sonderPct = parseNum(document.getElementById("sonderPct").value, "sonder-pct");
+
+    let sonderRaw = document.getElementById("sonder").value.trim();
+    let sonder;
+    if (sonderRaw === "") {
+      sonder = 0;
+    } else if (sonderRaw.toLowerCase() === "max") {
+      sonder = "max";
+    } else {
+      const v = Number(sonderRaw);
+      if (!Number.isFinite(v)) throw new Error('sondertilgung must be a number or "max"');
+      sonder = v;
+    }
+
+    if (rate == null) throw new Error("rate is required");
+    if (yearsNum == null) throw new Error("years is required");
+    if (tilgung == null) throw new Error("tilgung is required");
+
+    const resolved = resolveLoanAmount(loan, price, capital);
+    const result = buildSchedule(resolved.loan, rate, yearsNum, tilgung, sonder, sonderPct);
+
+    sumEl.textContent = buildSummary(resolved.costs, resolved.loan, rate, tilgung, yearsNum, result.monthlyAnnuity, sonder, sonderPct);
+
+    if (document.getElementById("showTable").checked) {
+      tblEl.innerHTML = buildTable(result.rows);
+    }
+    footEl.textContent = buildFooter(result.rows, result.totalInterest);
+  } catch (e) {
+    errEl.textContent = "Error: " + e.message;
+  }
+}
+
+document.getElementById("calc").addEventListener("click", calculate);
+document.getElementById("showTable").addEventListener("change", calculate);
+</script>
+</body>
+</html>
